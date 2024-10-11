@@ -1,5 +1,5 @@
-█▀ █▄▀ █▄█ █░█░█ ▄▀█ █░░ █▄▀ █▀▀ █▀█
-▄█ █░█ ░█░ ▀▄▀▄▀ █▀█ █▄▄ █░█ ██▄ █▀▄
+# █▀ █▄▀ █▄█ █░█░█ ▄▀█ █░░ █▄▀ █▀▀ █▀█
+# ▄█ █░█ ░█░ ▀▄▀▄▀ █▀█ █▄▄ █░█ ██▄ █▀▄
 
 #Module import
 import numpy as np
@@ -35,6 +35,8 @@ class night():
         #Initialising arrays
         self.target_coords = []
         self.names = []
+        self.priorities = []
+        self.obs_times = []
         self.paths = {}
         self.data = pd.DataFrame()
         self.min_angle = min_angle
@@ -73,11 +75,12 @@ class night():
         self.lunar_path = functions.offset_path([self.lunar_coords[0], self.lunar_coords[1]], self.observatory, self.mid_point)
     
     #Loading observation targets
-    def load_targets(self, objects, names = None, delimiter = ','):
+    def load_targets(self, objects, names = None, obs_times = None, priorities = None, delimiter = ','):
         #Parsing of list of coordinates
         if type(objects) == list:
             self.target_coords = objects
             
+            #Names (default to numbered list)
             if type(names) == list:
                 if len(names) == len(objects):
                     self.names = names
@@ -86,6 +89,26 @@ class night():
                     return -1
             else:
                 self.names = list(np.arange(1, len(objects)+1))
+
+            #Priorities (default to 1)
+            if type(priorities) == list:
+                if len(priorities) == len(objects):
+                    self.priorities = priorities
+                else:
+                    print('The priorities and object lists must be equal in length.')
+                    return -1
+            else:
+                self.priorities = list(np.zeros_like(objects) + 1)
+
+            #Observation times (default to 600s)
+            if type(obs_times) == list:
+                if len(obs_times) == len(objects):
+                    self.obs_times = obs_times
+                else:
+                    print('The obs_times and object lists must be equal in length.')
+                    return -1
+            else:
+                self.ob_times = list(np.zeros_like(objects) + 600)
         
         #Parsing of input csv file
         elif type(objects) == str:
@@ -102,10 +125,25 @@ class night():
                 dec0 = functions.convert_hms_dec(data['dec'][i])
                 self.target_coords.append([ra0, dec0])
                 self.names.append(data['name'][i])
+
+                try:
+                    self.priorities.append(data['priority'][i])
+                except:
+                    pass
+                try:
+                    self.obs_times.append(data['obs_time'][i])
+                except:
+                    pass
         
+        data_df = {'ra':np.array(self.target_coords)[:,0], 'dec':np.array(self.target_coords)[:,1]}
+        if len(self.priorities) == len(self.names):
+            data_df['priority'] = self.priorities
+        if len(self.obs_times) == len(self.names):
+            data_df['obs_times'] = self.obs_times
+
         #Constructing dataframe
-        self.data = pd.DataFrame({'ra':np.array(self.target_coords)[:,0], 'dec':np.array(self.target_coords)[:,1]}, index = self.names)
-            
+        self.data = pd.DataFrame(data_df, index = self.names)
+        
         #Calculating target paths across the sky
         self.paths = {}
         for n in self.names:
