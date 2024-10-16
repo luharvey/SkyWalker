@@ -15,6 +15,18 @@ earth = planets['earth']
 moon = planets['moon']
 sun = planets['sun']
 
+#Parameters for time/angle conversions
+sidereal_day = 86164.091
+degrees_per_second = 360/(sidereal_day)
+seconds_per_degree = 86164.091/360
+degrees_per_minute = degrees_per_second*60
+minutes_per_degree = seconds_per_degree/60
+hours_per_degree = minutes_per_degree/60
+day_rotation = degrees_per_minute * (60*24)
+
+#Defining priority colours for plotting of the queue
+priority_colours = {1:'#1ABC9C', 2:'#FFB900', 3:'#FF9600', 4:'#D62727'}
+
 #Trigonometric functions
 def sin(angle):
     return np.sin(np.deg2rad(angle))
@@ -24,6 +36,22 @@ def arcsin(value):
     return np.rad2deg(np.arcsin(value))
 def arccos(value):
     return np.rad2deg(np.arccos(value))
+
+#Cut a pair of arrays to the limits given upon the leading array
+def cut_array(x, y, x_lims, inclusive = True):
+    mindex, maxdex = 0, -1
+    for i in range(len(x)):
+        if x[i] > x_lims[0]:
+            mindex = i-1
+            break
+    for i in range(mindex, len(x)):
+        if x[i] > x_lims[1]:
+            if inclusive:
+                maxdex = i
+            else:
+                maxdex = i-1
+            break
+    return list(x[mindex:maxdex]), list(y[mindex:maxdex])
         
 #Converting latitude
 def convert_latitude(angle):
@@ -124,7 +152,8 @@ def offset_path(obj, obs, mid_point):
     r, d = convert_hms_ra(obj[0]), convert_hms_dec(obj[1])
     a = obs.latitude
     
-    angles = np.arange(mid_point-180, mid_point+180, 1)
+    #angles = np.arange(mid_point-180, mid_point+180, 1)
+    angles = np.linspace(mid_point-180, mid_point+180, 361)
     theta = angles-r
     
     return arcsin( sin(a)*sin(d) + cos(a)*cos(d)*cos(theta) )
@@ -163,8 +192,10 @@ def angle_to_moon(obj, lunar_coords):
 #Calculating twilight angles
 def twilights(date, obs):
     ra0 = np.arange(0, 362, 1)
-    solar_path0 = path(solar_radec(date), obs)
-    mid_point = ra0[np.argmin(solar_path0)]
+    solar_coords = solar_radec(date)
+    solar_path0 = path(solar_coords, obs)
+    #mid_point = ra0[np.argmin(solar_path0)]
+    mid_point = solar_coords[0] + day_rotation/2
 
     ra = np.arange(mid_point-180, mid_point+180, 1)
     solar_path = offset_path(solar_radec(date), obs, mid_point)
@@ -191,4 +222,4 @@ def twilights(date, obs):
         if solar_path[i] > -6.0 and solar_path[i+1] < -6.0:
             civil_twilight[0] = ra[i]
                 
-    return mid_point, [astronomical_twilight, nautical_twilight, civil_twilight]
+    return solar_coords, mid_point, [astronomical_twilight, nautical_twilight, civil_twilight]

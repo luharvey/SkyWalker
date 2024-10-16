@@ -4,11 +4,18 @@
 #Module import
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib import rc
 import pandas as pd
 from datetime import date
 from skyfield.api import load
 from astropy.time import Time
 import functions
+from matplotlib.ticker import (MultipleLocator, AutoMinorLocator)
+import duckdb
+import plotly.graph_objects as go
+
+#Disabling warning regarding the setting of values in dataframe copies
+pd.options.mode.chained_assignment = None
 
 #Initialising time properties
 ts = load.timescale()
@@ -22,7 +29,9 @@ plt.rcParams['mathtext.fontset'] = 'custom'
 plt.rcParams['mathtext.rm'] = 'Times New Roman'
 plt.rcParams['mathtext.it'] = 'Times New Roman'
 plt.rcParams['mathtext.bf'] = 'Times New Roman'
-#plt.rcParams.update({'font.size': 16})
+
+rc('xtick', labelsize=16)
+rc('ytick', labelsize=16)
 
 #Plot styles
 linestyles = {0:'-', 1:'-.', 2:':', 3:'--'}
@@ -31,12 +40,14 @@ colours = ['C3', '#FC6A0B', '#FCBE0B', '#00E65B', '#4BE1C3', 'C9', '#488DFF', '#
 #Night class
 #This is the class that shall be initialised by the user, to which targets can be loaded and from which plots can be generated
 class night():
-    def __init__(self, obs_id, date = today_mjd, min_angle = None, max_angle = None):
+    def __init__(self, obs_id, date = today_mjd, min_angle = 0, max_angle = 90):
         #Initialising arrays
         self.target_coords = []
+        self.night_peak = []
         self.names = []
         self.priorities = []
         self.obs_times = []
+        self.obs_times_angles = []
         self.paths = {}
         self.data = pd.DataFrame()
         self.min_angle = min_angle
@@ -65,10 +76,11 @@ class night():
         self.date_ymd = Time(date, format = 'mjd', scale = 'utc').isot.split(sep = 'T')[0]
         
         #Calculating twilights
-        self.mid_point, self.twilights = functions.twilights(self.date, self.observatory)
+        self.solar_coords, self.mid_point, self.twilights = functions.twilights(self.date, self.observatory)
         
         #Setting right ascension array (x axis for plots)
-        self.night_ra = np.arange(self.mid_point-180, self.mid_point+180, 1)
+        #self.night_ra = np.arange(self.mid_point-180, self.mid_point+180)
+        self.night_ra = np.linspace(round(self.mid_point, 0)-180, round(self.mid_point, 0)+180, 361)
         
         #Retrieving lunar coordinates and calculating lunar path
         self.lunar_coords = functions.lunar_radec(self.date_ymd)
@@ -79,6 +91,12 @@ class night():
         #Parsing of list of coordinates
         if type(objects) == list:
             self.target_coords = objects
+
+            for i in range(len(self.target_coords)):
+                if self.target_coords[i][0] < self.night_ra[0]:
+                    self.night_peak.append(int(round(self.target_coords[i][0] + 360, 0)))
+                else:
+                    self.night_peak.append(int(round(self.target_coords[i][0], 0)))
             
             #Names (default to numbered list)
             if type(names) == list:
@@ -98,17 +116,25 @@ class night():
                     print('The priorities and object lists must be equal in length.')
                     return -1
             else:
-                self.priorities = list(np.zeros_like(objects) + 1)
+                self.priorities = list(np.ones(len(objects)))
+
+            for i in range(len(self.priorities)):
+                self.priorities[i] = int(self.priorities[i])
 
             #Observation times (default to 600s)
             if type(obs_times) == list:
                 if len(obs_times) == len(objects):
                     self.obs_times = obs_times
+                    self.obs_times_angles = list(np.array(obs_times) * functions.degrees_per_second)
                 else:
                     print('The obs_times and object lists must be equal in length.')
                     return -1
             else:
                 self.ob_times = list(np.zeros_like(objects) + 600)
+                self.obs_times_angles = list(np.zeros_like(objects) + np.ceil(600 * functions.degrees_per_second))
+
+            for i in range(len(self.obs_times_angles)):
+                self.obs_times_angles[i] = int(np.ceil(self.obs_times_angles[i]))
         
         #Parsing of input csv file
         elif type(objects) == str:
@@ -123,110 +149,524 @@ class night():
             for i in range(len(data['name'])):
                 ra0 = functions.convert_hms_ra(data['ra'][i])
                 dec0 = functions.convert_hms_dec(data['dec'][i])
+
+                if ra0 < self.night_ra[0]:
+                    night_peak = int(round(ra0 + 360, 0))
+                else:
+                    night_peak = int(round(ra0, 0))
+
                 self.target_coords.append([ra0, dec0])
+                self.night_peak.append(night_peak)
                 self.names.append(data['name'][i])
 
                 try:
-                    self.priorities.append(data['priority'][i])
+                    self.priorities.append(int(data['priority'][i]))
                 except:
                     pass
                 try:
                     self.obs_times.append(data['obs_time'][i])
+                    self.obs_times_angles.append(int(np.ceil(data['obs_time'][i] * functions.degrees_per_second)))
                 except:
                     pass
         
-        data_df = {'ra':np.array(self.target_coords)[:,0], 'dec':np.array(self.target_coords)[:,1]}
+        #Defining dictionary from which to construct the dataframe
+        data_df = {'name':self.names, 'ra':np.array(self.target_coords)[:,0], 'dec':np.array(self.target_coords)[:,1]}
         if len(self.priorities) == len(self.names):
             data_df['priority'] = self.priorities
         if len(self.obs_times) == len(self.names):
             data_df['obs_times'] = self.obs_times
+            data_df['obs_time_angles'] = self.obs_times_angles
+        if len(self.night_peak) == len(self.names):
+            data_df['night_peak'] = self.night_peak
 
         #Constructing dataframe
-        self.data = pd.DataFrame(data_df, index = self.names)
+        self.data_duckdb = pd.DataFrame(data_df)
+        self.data = self.data_duckdb.set_index('name')
         
         #Calculating target paths across the sky
         self.paths = {}
-        for n in self.names:
-            self.paths[n] = functions.offset_path([self.data['ra'][n], self.data['dec'][n]], self.observatory, self.mid_point)
-           
-    #Plotting function
-    def plot(self, targets = None, moon = True, moon_distance = False, angle_limits = True, figsize = (15,10), title = None):
+        for i,n in enumerate(self.names):
+            self.paths[n] = functions.offset_path([self.data['ra'][i], self.data['dec'][i]], self.observatory, self.mid_point)
 
-        #Plot properties
-        fig = plt.figure(figsize = figsize, dpi = 200)
-        ax = fig.add_subplot(111)
-        for axis in ['top', 'bottom', 'right', 'left']:
-            ax.spines[axis].set_linewidth(2)
-        ax.xaxis.set_tick_params(width=2, length = 6)
-        ax.yaxis.set_tick_params(width=2, length = 6)
-        ax.set_xlabel('RA$_{peak}$', fontsize = 16)
-        ax.set_ylabel(r'$\varphi$', fontsize = 16)
-        ax.text(0.01, 1.01, self.observatory.name + ' - ' + str(self.date_ymd), transform = ax.transAxes, va = 'bottom', ha = 'left', weight = 'bold', fontsize = 16)
-        ax.text(0.99, 1.01, str(round(self.observatory.latitude, 3)) + 'N, ' + str(round(self.observatory.longitude, 3)) + 'E - Elevation: ' + str(self.observatory.elevation) + 'm - ' + self.observatory.country, transform = ax.transAxes, va = 'bottom', ha = 'right', fontsize = 16)
-            
-        #Plotting all target paths
-        if targets == None:
-            for j, name in enumerate(self.names):
-                ax.plot(self.night_ra, self.paths[name], lw = 3, label = name, linestyle = linestyles[int(j/10)%4], color = colours[j%10], alpha = 0.6)
-                
-                if moon_distance:
-                    moon = functions.angle_to_moon([self.data['ra'][name], self.data['dec'][name]], self.lunar_coords)
-                    for i in range(len(self.night_ra)):
-                        if (i+2*j)%40==0 and self.twilights[2][0]-10<self.night_ra[i]<self.twilights[2][1]+10 and 5<self.paths[name][i]<85:
-                            ax.text(self.night_ra[i], self.paths[name][i], moon, va = 'center', ha = 'center')
-        #Plotting specified target paths
-        else:
-            for j, name in enumerate(targets):
-                ax.plot(self.night_ra, self.paths[name], lw = 3, label = name, linestyle = linestyles[int(j/10)%4], color = colours[j%10], alpha = 0.6)
-                
-                if moon_distance:
-                    moon = functions.angle_to_moon([self.data['ra'][name], self.data['dec'][name]], self.lunar_coords)
-                    for i in range(len(self.night_ra)):
-                        if (i+2*j)%40==0 and self.twilights[2][0]-10<self.night_ra[i]<self.twilights[2][1]+10 and 5<self.paths[name][i]<85:
-                            ax.text(self.night_ra[i], self.paths[name][i], moon, va = 'center', ha = 'center')
-        
-        #Setting axis bounds
-        ax.set_xlim(self.twilights[2][0] - 10, self.twilights[2][1] + 10)
-        ax.set_ylim(-5, 90)
-        
-        #Shading horizon
-        ax.axhline(0, color = 'k', zorder = 10, lw = 3)
-        ax.fill_between([self.night_ra[0], self.night_ra[-1]], -6, 0, color = 'k', alpha = 0.6, zorder = 10)
-        
-        #Shading twilight regions
-        for twilight in self.twilights:
-            ax.axvline(twilight[0], color = 'k', linestyle = ':', lw = 2)
-            ax.axvline(twilight[1], color = 'k', linestyle = ':', lw = 2)
-        ax.fill_between([self.twilights[1][0], self.twilights[0][0]], 0, 91, color = 'k', alpha = 0.1, zorder = 10, edgecolor = None)
-        ax.fill_between([self.twilights[0][1], self.twilights[1][1]], 0, 91, color = 'k', alpha = 0.1, zorder = 10, edgecolor = None)
-        ax.fill_between([self.twilights[2][0], self.twilights[1][0]], 0, 91, color = 'k', alpha = 0.2, zorder = 10, edgecolor = None)
-        ax.fill_between([self.twilights[1][1], self.twilights[2][1]], 0, 91, color = 'k', alpha = 0.2, zorder = 10, edgecolor = None)
-        ax.fill_between([self.night_ra[0], self.twilights[2][0]], 0, 91, color = 'k', alpha = 0.3, zorder = 10, edgecolor = None)
-        ax.fill_between([self.twilights[2][1], self.night_ra[-1]], 0, 91, color = 'k', alpha = 0.3, zorder = 10, edgecolor = None)
-        
-        #Plotting lunar path
-        if moon:
-            ax.plot(self.night_ra, self.lunar_path, color = 'k', lw = 3, linestyle = ':')
-        
-        #Shading limiting angles
-        if angle_limits:
-            if self.min_angle != None:
-                ax.axhline(self.min_angle, color = 'C3', linestyle = ':', lw = 2)
-                ax.fill_between([self.night_ra[0], self.night_ra[-1]], 0, self.min_angle, color = 'C3', alpha = 0.2, zorder = 10)
-            if self.max_angle != None:
-                ax.axhline(self.max_angle, color = 'C3', linestyle = ':', lw = 2)
-                ax.fill_between([self.night_ra[0], self.night_ra[-1]], self.max_angle, 91, color = 'C3', alpha = 0.2, zorder = 10)
-                
-        #Setting legend
-        if targets == None:
-            if len(self.names) != 0:
-                ax.legend(frameon = 0, ncol = 5, mode = 'expand', bbox_to_anchor=(0.0, -0.15, 1.0, 0.0), fontsize = 16)
-        elif len(targets) != 0:
-            ax.legend(frameon = 0, ncol = 5, mode = 'expand', bbox_to_anchor=(0.0, -0.15, 1.0, 0.0), fontsize = 16)
-        
-        #Setting plot title
-        if title != None:
-            plt.title(title)
+    #Plotting function
+    def plot_paths(self, targets = None, style = 'plotly', moon = True, moon_distance = False, angle_limits = True, figsize = (15,10), title = None, angle_ax = False):
+        if style == 'plotly':
+            fig = go.Figure()
     
-        plt.tight_layout()
-        plt.show()
+            #Plotting target traces
+            if targets == None:
+                for name in self.data.index:
+                    fig.add_trace(go.Scatter(x=self.night_ra, y=self.paths[name], mode = 'lines', name = name))
+            else:
+                for name in targets:
+                    fig.add_trace(go.Scatter(x=self.night_ra, y=self.paths[name], mode = 'lines', name = name))   
+                
+            #Plotting moon trace
+            if moon:
+                fig.add_trace(go.Scatter(x=self.night_ra, y=self.lunar_path, mode = 'lines', name = 'Moon', line = dict(color = 'black', dash = 'dot')))
+            
+            #Setting axis ranges
+            fig.update_layout(yaxis_range = [-10, 90], yaxis_title = 'Elevation angle')
+            fig.update_layout(xaxis_range = [self.twilights[2][0]-10, self.twilights[2][1]+10], xaxis_title = 'Peak RA')
+    
+            #Setting plot font
+            fig.update_layout(font = dict(family="Times",size=16))
+    
+            #Shading limiting angles
+            if angle_limits:
+                fig.add_trace(go.Scatter(x=[self.night_ra[0], self.night_ra[-1]], y=[self.min_angle, self.min_angle], line = dict(color = 'rgba(214, 27, 27, 0)'), fillcolor = 'rgba(214, 27, 27, 0.3)', showlegend=False, fill = 'tozeroy'))
+    
+                fig.add_trace(go.Scatter(x=[self.night_ra[0], self.night_ra[-1]], y=[100, 100], line = dict(color = 'rgba(214, 27, 27, 0)'), fillcolor = 'rgba(214, 27, 27, 0.3)', showlegend=False))
+                fig.add_trace(go.Scatter(x=[self.night_ra[0], self.night_ra[-1]], y=[self.max_angle, self.max_angle], line = dict(color = 'rgba(214, 27, 27, 0)'), fillcolor = 'rgba(214, 27, 27, 0.3)', showlegend=False, fill = 'tonexty'))
+            
+            #Shading ground
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.night_ra[-1]], y=[0, 0], line = dict(color = 'black'), showlegend=False))
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.night_ra[-1]], y=[-90, -90], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.8)', showlegend=False))
+            
+            #Shading sunsets
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.twilights[0][0]], y=[100, 100], line = dict(color = 'black'), showlegend=False, mode = 'lines'))
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.twilights[0][0]], y=[0, 0], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.2)', showlegend=False, mode = 'lines'))
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.twilights[1][0]], y=[100, 100], line = dict(color = 'black'), showlegend=False, marker={'opacity': 0}))
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.twilights[1][0]], y=[0, 0], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.2)', showlegend=False, mode = 'lines'))
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.twilights[2][0]], y=[100, 100], line = dict(color = 'black'), showlegend=False, marker={'opacity': 0}))
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.twilights[2][0]], y=[0, 0], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.2)', showlegend=False, mode = 'lines'))
+            
+            #Shading sunrises
+            fig.add_trace(go.Scatter(x=[self.twilights[0][1], self.night_ra[-1]], y=[100, 100], line = dict(color = 'black'), showlegend=False, mode = 'lines'))
+            fig.add_trace(go.Scatter(x=[self.twilights[0][1], self.night_ra[-1]], y=[0, 0], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.2)', showlegend=False, mode = 'lines', name = 'Astronomical sunrise'))
+            fig.add_trace(go.Scatter(x=[self.twilights[1][1], self.night_ra[-1]], y=[100, 100], line = dict(color = 'black'), showlegend=False, mode = 'lines'))
+            fig.add_trace(go.Scatter(x=[self.twilights[1][1], self.night_ra[-1]], y=[0, 0], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.2)', showlegend=False, mode = 'lines', name = 'Nautical sunrise'))
+            fig.add_trace(go.Scatter(x=[self.twilights[2][1], self.night_ra[-1]], y=[100, 100], line = dict(color = 'black'), showlegend=False, mode = 'lines'))
+            fig.add_trace(go.Scatter(x=[self.twilights[2][1], self.night_ra[-1]], y=[0, 0], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.2)', showlegend=False, mode = 'lines', name = 'Civil sunrise'))
+            
+            fig.show()
+
+        elif style == 'matplotlib':
+            #Calculating angle/time conversion
+            utc_t0 = (self.solar_coords[0]-(360-self.observatory.longitude)) + functions.day_rotation/2
+            lower_bound = self.mid_point - (self.twilights[2][0] - 10)
+            upper_bound = (self.twilights[2][1] + 10) - self.mid_point
+            lower_bound_difference = (self.twilights[2][0] - 10) - utc_t0
+            upper_bound_difference = (self.twilights[2][1] + 10) - utc_t0
+            lower_bound_hours = lower_bound_difference*functions.hours_per_degree
+            upper_bound_hours = upper_bound_difference*functions.hours_per_degree 
+    
+            #Plot properties
+            fig = plt.figure(figsize = figsize, dpi = 200)
+            ax_ut = fig.add_subplot(111)
+            ax = ax_ut.twiny()
+            for axis in ['top', 'bottom', 'right', 'left']:
+                ax.spines[axis].set_linewidth(2)
+            ax_ut.xaxis.set_tick_params(width=2, length = 6)
+            ax_ut.xaxis.set_tick_params(width=1, length = 4, which = 'minor')
+            ax.yaxis.set_tick_params(width=2, length = 6)
+            if angle_ax == False:
+                ax.set_xticks([])
+                ax.text(0.01, 1.01, self.observatory.name + ' - ' + str(self.date_ymd), transform = ax.transAxes, va = 'bottom', ha = 'left', weight = 'bold', fontsize = 16)
+                ax.text(0.99, 1.01, str(round(self.observatory.latitude, 2)) + 'N, ' + str(round(self.observatory.longitude, 2)) + 'E - Elevation: ' + str(self.observatory.elevation) + 'm - ' + self.observatory.country, transform = ax.transAxes, va = 'bottom', ha = 'right', fontsize = 16)
+            else:
+                ax.set_xlabel('RA$_{peak}$', fontsize = 16)
+            ax_ut.set_xlabel('UT', fontsize = 16)
+            ax.set_ylabel(r'$\varphi$', fontsize = 16)
+            ax_ut.set_xlim(lower_bound_hours, upper_bound_hours)
+            ax_ut.xaxis.set_major_locator(MultipleLocator(1))
+            ax_ut.xaxis.set_minor_locator(MultipleLocator(0.25))
+    
+            #Plotting all target paths
+            if targets == None:
+                for j, name in enumerate(self.names):
+                    ax.plot(self.night_ra, self.paths[name], lw = 3, label = name, linestyle = linestyles[int(j/10)%4], color = colours[j%10], alpha = 0.6)
+                    
+                    if moon_distance:
+                        moon = functions.angle_to_moon([self.data['ra'][name], self.data['dec'][name]], self.lunar_coords)
+                        for i in range(len(self.night_ra)):
+                            if (i+2*j)%40==0 and self.twilights[2][0]-10<self.night_ra[i]<self.twilights[2][1]+10 and 5<self.paths[name][i]<85:
+                                ax.text(self.night_ra[i], self.paths[name][i], moon, va = 'center', ha = 'center', fontsize = 16)
+            
+            #Plotting specified target paths
+            else:
+                for j, name in enumerate(targets):
+                    ax.plot(self.night_ra, self.paths[name], lw = 3, label = name, linestyle = linestyles[int(j/10)%4], color = colours[j%10], alpha = 0.6)
+                    
+                    if moon_distance:
+                        moon = functions.angle_to_moon([self.data['ra'][name], self.data['dec'][name]], self.lunar_coords)
+                        for i in range(len(self.night_ra)):
+                            if (i+2*j)%40==0 and self.twilights[2][0]-10<self.night_ra[i]<self.twilights[2][1]+10 and 5<self.paths[name][i]<85:
+                                ax.text(self.night_ra[i], self.paths[name][i], moon, va = 'center', ha = 'center', fontsize = 16)
+            
+            #Setting axis bounds
+            ax.set_xlim(self.twilights[2][0] - 10, self.twilights[2][1] + 10)
+            ax.set_ylim(-5, 90)
+            
+            #Shading horizon
+            ax.axhline(0, color = 'k', zorder = 10, lw = 3)
+            ax.fill_between([self.night_ra[0], self.night_ra[-1]], -6, 0, color = 'k', alpha = 0.6, zorder = 10)
+            
+            #Shading twilight regions
+            ax.fill_between([self.twilights[1][0], self.twilights[0][0]], 0, 91, color = 'k', alpha = 0.1, zorder = 10, edgecolor = None)
+            ax.fill_between([self.twilights[0][1], self.twilights[1][1]], 0, 91, color = 'k', alpha = 0.1, zorder = 10, edgecolor = None)
+            ax.fill_between([self.twilights[2][0], self.twilights[1][0]], 0, 91, color = 'k', alpha = 0.2, zorder = 10, edgecolor = None)
+            ax.fill_between([self.twilights[1][1], self.twilights[2][1]], 0, 91, color = 'k', alpha = 0.2, zorder = 10, edgecolor = None)
+            ax.fill_between([self.night_ra[0], self.twilights[2][0]], 0, 91, color = 'k', alpha = 0.3, zorder = 10, edgecolor = None)
+            ax.fill_between([self.twilights[2][1], self.night_ra[-1]], 0, 91, color = 'k', alpha = 0.3, zorder = 10, edgecolor = None)
+            
+            #Plotting lunar path
+            if moon:
+                ax.plot(self.night_ra, self.lunar_path, color = 'k', lw = 3, linestyle = ':')
+            
+            #Shading limiting angles
+            if angle_limits:
+                if self.min_angle != None:
+                    ax.fill_between([self.night_ra[0], self.night_ra[-1]], 0, self.min_angle, color = 'C3', alpha = 0.2, zorder = 10)
+                if self.max_angle != None:
+                    ax.fill_between([self.night_ra[0], self.night_ra[-1]], self.max_angle, 91, color = 'C3', alpha = 0.2, zorder = 10)
+                    
+            #Setting legend
+            if targets == None:
+                if len(self.names) != 0:
+                    ax.legend(frameon = 0, ncol = 5, mode = 'expand', bbox_to_anchor=(0.0, -0.15, 1.0, 0.0), fontsize = 16)
+            elif len(targets) != 0:
+                ax.legend(frameon = 0, ncol = 5, mode = 'expand', bbox_to_anchor=(0.0, -0.15, 1.0, 0.0), fontsize = 16)
+            
+            #Setting plot title
+            if title != None:
+                plt.title(title)
+        
+            plt.tight_layout()
+            plt.show()
+
+        else:
+            print(f"'{style}' not and acceptable style setting. The options are 'plotly' and 'matplotlib'.")
+
+    def generate_queue(self, limiting_twilight = 'astronomical'):
+        #Deciding which sunset to start the queue from
+        if limiting_twilight == 'astronomical':
+            self.limiting_twilight = self.twilights[0]
+        elif limiting_twilight == 'nautical':
+            self.limiting_twilight = self.twilights[1]
+        elif limiting_twilight == 'civil':
+            self.limiting_twilight = self.twilights[2]
+        else:
+            print(f"'{limiting_twilight}' not and acceptable twilight setting. The options are 'astronomical', 'nautical', and 'civil'. Defaulting to 'astronomical'.")
+            self.limiting_twilight = self.twilights[0]
+
+        #Creating empty dataframe to hold to queue
+        self.queue = pd.DataFrame(columns = ['name', 'ra', 'dec', 'priority', 'obs_times', 'obs_time_angles', 'night_peak', 'start_angle']).set_index('name')
+        self.reserve = []
+
+        #Setting data dataframe as variable within function accessible by duckdb SQL queries
+        data = self.data_duckdb
+        
+        #Dividing up the target table into priorities ordered by peak ra throughout the night
+        self.priorities = set(self.data['priority'])
+        self.priority_tables = {}
+        for p in self.priorities:
+            self.priority_tables[p] = duckdb.query(f"SELECT * FROM data WHERE priority = {p} ORDER BY night_peak ASC;").df()
+
+        for priority in self.priorities:
+            for name in self.priority_tables[priority].name:
+                self.add_to_queue(name)
+
+        while self.queue.start_angle[-1] + self.queue.obs_time_angles[-1] < self.limiting_twilight[1]:
+            self.add_gap_to_queue()
+            self.check_reserve_list()
+
+    def add_to_queue(self, name):
+        #Check if object meets the angular requirements somewhere between astronomical sunset and sunrise
+        if self.check_valid_object(name):
+
+            #If this is the first object add it at astronomical sunset
+            if len(self.queue) == 0:
+                start1 = int(np.ceil(self.limiting_twilight[0]))
+
+                #Compiling row dictionary adding target after
+                new_row1 = {'ra':self.data.ra[name], 'dec':self.data.dec[name], 'priority':self.data.priority[name], 'obs_times':self.data.obs_times[name], 'obs_time_angles':self.data.obs_time_angles[name], 'night_peak':self.data.night_peak[name], 'start_angle':start1} 
+
+            #Else calculate two start options
+            #1 appending the target to the end
+            #2 appending the target before the previously final target
+            else:
+                start1 = self.queue.start_angle[-1] + self.queue.obs_time_angles[-1]
+                start2 = self.queue.start_angle[-1]
+                replace_start2 = self.queue.start_angle[-1] + self.data['obs_time_angles'][name]
+            
+                #Compiling row dictionary adding target after
+                new_row1 = {'ra':self.data.ra[name], 'dec':self.data.dec[name], 'priority':self.data.priority[name], 'obs_times':self.data.obs_times[name], 'obs_time_angles':self.data.obs_time_angles[name], 'night_peak':self.data.night_peak[name], 'start_angle':start1} 
+                new_row2 = {'ra':self.data.ra[name], 'dec':self.data.dec[name], 'priority':self.data.priority[name], 'obs_times':self.data.obs_times[name], 'obs_time_angles':self.data.obs_time_angles[name], 'night_peak':self.data.night_peak[name], 'start_angle':start2} 
+    
+            #Creating new queue instance with new object appended at the end
+            new_queue1 = self.queue.copy()
+            new_queue1.loc[name] = new_row1
+    
+            if len(self.queue) == 0:
+                #Checking valid queue
+                valid1 = self.check_valid_queue(new_queue1)
+                if valid1:
+                    self.queue = new_queue1
+                    if name in self.reserve:
+                        self.reserve.remove(name)
+                    self.check_reserve_list()
+                    return
+                else:
+                    if name not in self.reserve:
+                        self.reserve.append(name)
+                    return
+            
+            else:
+                #Creating new queue instance with new target appended before the previously final target
+                new_queue2 = self.queue.copy()
+                new_queue2['start_angle'][-1] = replace_start2
+                new_queue2.loc[name] = new_row2
+    
+                valid1 = self.check_valid_queue(new_queue1)
+                valid2 = self.check_valid_queue(new_queue2)
+    
+                if valid1 == True and valid2 == True:
+                    #Both cases are valid, chose the queue that maximises the area underneath
+                    new_queue_max = self.calculate_maximum_areas(new_queue1, new_queue2, [self.queue.index[-1], name])
+
+                    self.queue = new_queue_max
+                    if name in self.reserve:
+                        self.reserve.remove(name)
+                    self.check_reserve_list()
+                    return
+                elif valid1 == True and valid2 == False:
+                    #Only new_queue1 is valid
+                    self.queue = new_queue1
+                    if name in self.reserve:
+                        self.reserve.remove(name)
+                    self.check_reserve_list()
+                    return
+                elif valid1 == False and valid2 == True:
+                    #Only new_queue2 is valid
+                    self.queue = new_queue2.sort_values('start_angle')
+                    if name in self.reserve:
+                        self.reserve.remove(name)
+                    self.check_reserve_list()
+                    return
+                else:
+                    if name not in self.reserve:
+                        self.reserve.append(name)
+                    return
+
+    #Passing through the reserve list trying to add objects
+    def check_reserve_list(self):
+        #Reserve is empty, skip
+        if len(self.reserve) == 0:
+            return
+        #Pass through reserves and attempt to add the to the queue
+        else:
+            for name in self.reserve:
+                self.add_to_queue(name)
+
+    #Running through the queue to test if the objects are observable
+    def check_valid_queue(self, queue):
+        for name in queue.index:
+            if '__gap' not in name:
+                cut_path = functions.cut_array(self.night_ra, self.paths[name], [queue['start_angle'][name], queue['start_angle'][name]+queue['obs_time_angles'][name]])
+                for i in range(len(cut_path[0])):
+                    if self.max_angle < cut_path[1][i] or self.min_angle > cut_path[1][i]:
+                        #Invalid angle instance located, return False
+                        return False
+                
+                    #Overlapping with final twilight
+                    if cut_path[0][i] > self.limiting_twilight[1]:
+                        return False
+
+        #If no objects have thrown up a false flag, return True
+        return True
+
+    def check_valid_object(self, name):
+        #Cut object path to between astronomical sunset and sunrise
+        cut_path = functions.cut_array(self.night_ra, self.paths[name], [self.limiting_twilight[0], self.limiting_twilight[1]])
+
+        for i in range(len(cut_path[0])):
+            if self.min_angle < cut_path[1][i] < self.max_angle:
+                #Valid angle instance located, return True
+                return True
+        return False
+
+    #Comparing the total areas from two queues and returning the maximum
+    def calculate_maximum_areas(self, queue1, queue2, objs):
+        #If one of the two objects is a gap, skip the check
+        for name in objs:
+            if '__gap' in name:
+                return queue1
+
+        cut_paths1 = []
+        cut_paths2 = []
+
+        for name in objs:
+            cut_paths1.append(functions.cut_array(self.night_ra, self.paths[name], [queue1['start_angle'][name], queue1['start_angle'][name]+queue1['obs_time_angles'][name]]))
+            cut_paths2.append(functions.cut_array(self.night_ra, self.paths[name], [queue2['start_angle'][name], queue2['start_angle'][name]+queue2['obs_time_angles'][name]]))
+
+        area1 = 0
+        area2 = 0
+
+        for i in range(len(cut_paths1)):
+            area1 += np.trapz(cut_paths1[i][1], cut_paths1[i][0])
+            area2 += np.trapz(cut_paths2[i][1], cut_paths2[i][0])
+
+        if area2 > area1:
+            return queue2.sort_values('start_angle')
+        else:
+            return queue1
+
+    def add_gap_to_queue(self):
+        if '__gap' in self.queue.index[-1]:
+            self.queue['obs_time_angles'][-1] += 1
+        else:
+            index = 1
+            for name in self.queue.index:
+                if '__gap' in name:
+                    index += 1
+
+            new_row = {'ra':None, 'dec':None, 'priority':None, 'obs_times':None, 'obs_time_angles':1, 'night_peak':None, 'start_angle':self.queue['start_angle'][-1] + self.queue['obs_time_angles'][-1]} 
+            self.queue.loc[f'__gap{index}__'] = new_row
+
+    #Plot the derived queue
+    def plot_queue(self, style = 'plotly', moon = False, moon_distance = False, angle_limits = True, figsize = (15,10), title = None, angle_ax = False, priority_colours = {1:'#1ABC9C', 2:'#FFB900', 3:'#FF9600', 4:'#D62727'}):
+        if style == 'plotly':
+            fig = go.Figure()
+
+            #Cutting path slices for the observations
+            cut_paths = {}
+            for name in self.queue.index:
+                if '__gap' not in name:
+                    cut_paths[name] = functions.cut_array(self.night_ra, self.paths[name], [self.queue['start_angle'][name], self.queue['start_angle'][name]+self.queue['obs_time_angles'][name]])
+                    fig.add_trace(go.Scatter(x=self.night_ra, y=self.paths[name], mode = 'lines', name = "", line = dict(color = 'rgba(0, 0, 0, 0.1)'), showlegend = False))
+    
+            #Plotting target traces
+            for name in self.queue.index:
+                if '__gap' not in name:
+                    fig.add_trace(go.Scatter(x=cut_paths[name][0], y=cut_paths[name][1], mode = 'lines', name = name, fill='tozeroy', line = dict(color = priority_colours[self.queue.priority[name]])))
+    
+            #Plotting moon trace
+            if moon:
+                fig.add_trace(go.Scatter(x=self.night_ra, y=self.lunar_path, mode = 'lines', name = 'Moon', line = dict(color = 'black', dash = 'dot')))
+            
+            #Setting axis ranges
+            fig.update_layout(yaxis_range = [-10, 90], yaxis_title = 'Elevation angle')
+            fig.update_layout(xaxis_range = [self.twilights[2][0]-10, self.twilights[2][1]+10], xaxis_title = 'Peak RA')
+    
+            #Setting plot font
+            fig.update_layout(font = dict(family="Times",size=16))
+            
+            #Shading limiting angles
+            if angle_limits:
+                fig.add_trace(go.Scatter(x=[self.night_ra[0], self.night_ra[-1]], y=[self.min_angle, self.min_angle], line = dict(color = 'rgba(214, 27, 27, 0)'), fillcolor = 'rgba(214, 27, 27, 0.3)', showlegend=False, fill = 'tozeroy'))
+    
+                fig.add_trace(go.Scatter(x=[self.night_ra[0], self.night_ra[-1]], y=[100, 100], line = dict(color = 'rgba(214, 27, 27, 0)'), fillcolor = 'rgba(214, 27, 27, 0.3)', showlegend=False))
+                fig.add_trace(go.Scatter(x=[self.night_ra[0], self.night_ra[-1]], y=[self.max_angle, self.max_angle], line = dict(color = 'rgba(214, 27, 27, 0)'), fillcolor = 'rgba(214, 27, 27, 0.3)', showlegend=False, fill = 'tonexty'))
+    
+            #Shading ground
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.night_ra[-1]], y=[0, 0], line = dict(color = 'black'), showlegend=False))
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.night_ra[-1]], y=[-90, -90], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.8)', showlegend=False))
+            
+            #Shading sunsets
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.twilights[0][0]], y=[100, 100], line = dict(color = 'black'), showlegend=False, mode = 'lines'))
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.twilights[0][0]], y=[0, 0], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.2)', showlegend=False, mode = 'lines'))
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.twilights[1][0]], y=[100, 100], line = dict(color = 'black'), showlegend=False, marker={'opacity': 0}))
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.twilights[1][0]], y=[0, 0], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.2)', showlegend=False, mode = 'lines'))
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.twilights[2][0]], y=[100, 100], line = dict(color = 'black'), showlegend=False, marker={'opacity': 0}))
+            fig.add_trace(go.Scatter(x=[self.night_ra[0], self.twilights[2][0]], y=[0, 0], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.2)', showlegend=False, mode = 'lines'))
+            
+            #Shading sunrises
+            fig.add_trace(go.Scatter(x=[self.twilights[0][1], self.night_ra[-1]], y=[100, 100], line = dict(color = 'black'), showlegend=False, mode = 'lines'))
+            fig.add_trace(go.Scatter(x=[self.twilights[0][1], self.night_ra[-1]], y=[0, 0], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.2)', showlegend=False, mode = 'lines', name = 'Astronomical sunrise'))
+            fig.add_trace(go.Scatter(x=[self.twilights[1][1], self.night_ra[-1]], y=[100, 100], line = dict(color = 'black'), showlegend=False, mode = 'lines'))
+            fig.add_trace(go.Scatter(x=[self.twilights[1][1], self.night_ra[-1]], y=[0, 0], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.2)', showlegend=False, mode = 'lines', name = 'Nautical sunrise'))
+            fig.add_trace(go.Scatter(x=[self.twilights[2][1], self.night_ra[-1]], y=[100, 100], line = dict(color = 'black'), showlegend=False, mode = 'lines'))
+            fig.add_trace(go.Scatter(x=[self.twilights[2][1], self.night_ra[-1]], y=[0, 0], line = dict(color = 'black'), fill='tonexty', fillcolor='rgba(0, 0, 0, 0.2)', showlegend=False, mode = 'lines', name = 'Civil sunrise'))
+            
+            fig.show()
+
+        elif style == 'matplotlib':
+            #Cutting path slices for the observations
+            self.cut_paths = {}
+            for name in self.queue.index:
+                if '__gap' not in name:
+                    self.cut_paths[name] = functions.cut_array(self.night_ra, self.paths[name], [self.queue['start_angle'][name], self.queue['start_angle'][name]+self.queue['obs_time_angles'][name]])
+    
+            #Calculating angle/time conversion
+            utc_t0 = (self.solar_coords[0]-(360-self.observatory.longitude)) + functions.day_rotation/2
+            lower_bound = self.mid_point - (self.twilights[2][0] - 10)
+            upper_bound = (self.twilights[2][1] + 10) - self.mid_point
+            lower_bound_difference = (self.twilights[2][0] - 10) - utc_t0
+            upper_bound_difference = (self.twilights[2][1] + 10) - utc_t0
+            lower_bound_hours = lower_bound_difference*functions.hours_per_degree
+            upper_bound_hours = upper_bound_difference*functions.hours_per_degree 
+    
+            #Plot properties
+            fig = plt.figure(figsize = figsize, dpi = 200)
+            ax_ut = fig.add_subplot(111)
+            ax = ax_ut.twiny()
+            for axis in ['top', 'bottom', 'right', 'left']:
+                ax.spines[axis].set_linewidth(2)
+            ax_ut.xaxis.set_tick_params(width=2, length = 6)
+            ax_ut.xaxis.set_tick_params(width=1, length = 4, which = 'minor')
+            ax.yaxis.set_tick_params(width=2, length = 6)
+            if angle_ax == False:
+                ax.set_xticks([])
+                ax.text(0.01, 1.01, self.observatory.name + ' - ' + str(self.date_ymd), transform = ax.transAxes, va = 'bottom', ha = 'left', weight = 'bold', fontsize = 16)
+                ax.text(0.99, 1.01, str(round(self.observatory.latitude, 2)) + 'N, ' + str(round(self.observatory.longitude, 2)) + 'E - Elevation: ' + str(self.observatory.elevation) + 'm - ' + self.observatory.country, transform = ax.transAxes, va = 'bottom', ha = 'right', fontsize = 16)
+            else:
+                ax.set_xlabel('RA$_{peak}$', fontsize = 16)
+            ax_ut.set_xlabel('UT', fontsize = 16)
+            ax.set_ylabel(r'$\varphi$', fontsize = 16)
+            ax_ut.set_xlim(lower_bound_hours, upper_bound_hours)
+            ax_ut.xaxis.set_major_locator(MultipleLocator(1))
+            ax_ut.xaxis.set_minor_locator(MultipleLocator(0.25))
+    
+            #Plotting all target paths
+            for j, name in enumerate(self.queue.index):
+                if '__gap' not in name:
+                    ax.plot(self.night_ra, self.paths[name], lw = 3, label = name, color = '#DDDDDD', alpha = 0.6)
+                    
+                    if moon_distance:
+                        moon = functions.angle_to_moon([self.data['ra'][name], self.data['dec'][name]], self.lunar_coords)
+                        for i in range(len(self.night_ra)):
+                            if (i+2*j)%40==0 and self.twilights[2][0]-10<self.night_ra[i]<self.twilights[2][1]+10 and 5<self.paths[name][i]<85:
+                                ax.text(self.night_ra[i], self.paths[name][i], moon, va = 'center', ha = 'center')
+    
+            #Plotting target observations
+            for name in self.queue.index:
+                ax.plot(self.cut_paths[name][0], self.cut_paths[name][1], color = 'k', lw = 3)
+                ax.fill_between(self.cut_paths[name][0], 0, self.cut_paths[name][1], color = priority_colours[self.data.priority[name]], alpha = 0.2)
+            
+            #Setting axis bounds
+            ax.set_xlim(self.twilights[2][0] - 10, self.twilights[2][1] + 10)
+            ax.set_ylim(-5, 90)
+            
+            #Shading horizon
+            ax.axhline(0, color = 'k', zorder = 10, lw = 3)
+            ax.fill_between([self.night_ra[0], self.night_ra[-1]], -6, 0, color = 'k', alpha = 0.6, zorder = 10)
+            
+            #Shading twilight regions
+            ax.fill_between([self.twilights[1][0], self.twilights[0][0]], 0, 91, color = 'k', alpha = 0.1, zorder = 10, edgecolor = None)
+            ax.fill_between([self.twilights[0][1], self.twilights[1][1]], 0, 91, color = 'k', alpha = 0.1, zorder = 10, edgecolor = None)
+            ax.fill_between([self.twilights[2][0], self.twilights[1][0]], 0, 91, color = 'k', alpha = 0.2, zorder = 10, edgecolor = None)
+            ax.fill_between([self.twilights[1][1], self.twilights[2][1]], 0, 91, color = 'k', alpha = 0.2, zorder = 10, edgecolor = None)
+            ax.fill_between([self.night_ra[0], self.twilights[2][0]], 0, 91, color = 'k', alpha = 0.3, zorder = 10, edgecolor = None)
+            ax.fill_between([self.twilights[2][1], self.night_ra[-1]], 0, 91, color = 'k', alpha = 0.3, zorder = 10, edgecolor = None)
+            
+            #Plotting lunar path
+            if moon:
+                ax.plot(self.night_ra, self.lunar_path, color = 'k', lw = 3, linestyle = ':')
+            
+            #Shading limiting angles
+            if angle_limits:
+                if self.min_angle != None:
+                    ax.fill_between([self.night_ra[0], self.night_ra[-1]], 0, self.min_angle, color = 'C3', alpha = 0.2, zorder = 10)
+                if self.max_angle != None:
+                    ax.fill_between([self.night_ra[0], self.night_ra[-1]], self.max_angle, 91, color = 'C3', alpha = 0.2, zorder = 10)
+            
+            #Setting plot title
+            if title != None:
+                plt.title(title)
+        
+            plt.tight_layout()
+            plt.show()
+
+        else:
+            print(f"'{style}' not and acceptable style setting. The options are 'plotly' and 'matplotlib'.")
