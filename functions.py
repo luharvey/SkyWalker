@@ -38,7 +38,7 @@ def arccos(value):
     return np.rad2deg(np.arccos(value))
 
 #Cut a pair of arrays to the limits given upon the leading array
-def cut_array(x, y, x_lims, inclusive = True):
+def cut_array(x, y, x_lims, z = None, inclusive = True):
     mindex, maxdex = 0, -1
     for i in range(len(x)):
         if x[i] > x_lims[0]:
@@ -51,7 +51,12 @@ def cut_array(x, y, x_lims, inclusive = True):
             else:
                 maxdex = i-1
             break
-    return list(x[mindex:maxdex]), list(y[mindex:maxdex])
+
+    try:
+        if z == None:
+            return list(x[mindex:maxdex]), list(y[mindex:maxdex])
+    except:
+        return list(x[mindex:maxdex]), list(y[mindex:maxdex]), list(z[mindex:maxdex])
         
 #Converting latitude
 def convert_latitude(angle):
@@ -64,13 +69,24 @@ def convert_latitude(angle):
     return factor * (float(split[0][:-1]) + float(split[1][:-1])/60 + float(split[2][:-1])/3600)
 
 #Converting longitude
+#def convert_longitude(angle):
+#    split = angle.split()
+#    if split[-1] == 'W':
+#        factor = -1
+#        offset = 360
+#    else:
+#        factor = 1
+#        offset = 0
+#        
+#    return offset + factor * (float(split[0][:-1]) + float(split[1][:-1])/60 + float(split[2][:-1])/3600)
+#Converting longitude
 def convert_longitude(angle):
     split = angle.split()
     if split[-1] == 'W':
-        factor = -1
-        offset = 360
-    else:
         factor = 1
+        offset = 0
+    else:
+        factor = -1
         offset = 0
         
     return offset + factor * (float(split[0][:-1]) + float(split[1][:-1])/60 + float(split[2][:-1])/3600)
@@ -124,6 +140,21 @@ def convert_hms_dec(dec):
     else:
         return float(dec)
         
+def mjd_to_era(mjd):
+    T = mjd-51544.5
+    
+    return 360 * (0.7790572732640 + 1.00273781191135448*T)
+
+def era_to_mjd(era):
+    T = (era/360 - 0.7790572732640)/1.00273781191135448
+    
+    return T + 51544.5
+
+def era_to_utc(era):
+    mjd = (era/360 - 0.7790572732640)/1.00273781191135448 + 51544.5
+    
+    return ts.ut1_jd(mjd + 2400000.5).utc_datetime()
+
 #Convert right ascension to degrees
 def convert_hms_ra(ra):
     string = str(ra)
@@ -136,44 +167,31 @@ def convert_hms_ra(ra):
             return -1
     else:
         return float(ra)
-    
+
 #Calulate path traced by object
-def path(obj, obs):
-    r, d = convert_hms_ra(obj[0]), convert_hms_dec(obj[1])
+def path_era(obj, obs, era):
+    if type(obj[0]) == str or type(obj[0]) == float:
+        r, d = convert_hms_ra(obj[0]), convert_hms_dec(obj[1])
+    else:
+        r, d = obj
     a = obs.latitude
-    
-    angles = np.arange(0, 362, 1)  
-    theta = angles-r
+    b = obs.longitude
+
+    angles = era
+    theta = angles-r-b
     
     return arcsin( sin(a)*sin(d) + cos(a)*cos(d)*cos(theta) )
 
-#Calulate path traced by object
-def offset_path(obj, obs, mid_point):
-    r, d = convert_hms_ra(obj[0]), convert_hms_dec(obj[1])
-    a = obs.latitude
-    
-    #angles = np.arange(mid_point-180, mid_point+180, 1)
-    angles = np.linspace(mid_point-180, mid_point+180, 361)
-    theta = angles-r
-    
-    return arcsin( sin(a)*sin(d) + cos(a)*cos(d)*cos(theta) )
-
-#Calculate solar coordinates for given date
-def solar_radec(date):
-    date = Time(date, format = 'mjd', scale = 'utc').isot.split(sep = 'T')[0]
-    
-    split = date.split(sep = '-')
-    year, month, day = float(split[0]), float(split[1]), float(split[2])
-    t = ts.utc(year, month, day)
+#Calculate solar coordinates for given date (mjd)
+def solar_radec_mjd(mjd):
+    t = ts.ut1_jd(mjd + 2400000.5)
     ra, dec, _ = earth.at(t).observe(sun).radec()
     
     return ra._degrees, dec.degrees
 
-#Calculate lunar coordinates for given date
-def lunar_radec(date):
-    split = date.split(sep = '-')
-    year, month, day = float(split[0]), float(split[1]), float(split[2])
-    t = ts.utc(year, month, day)
+#Calculate lunar coordinates for given date (mjd)
+def lunar_radec_mjd(mjd):
+    t = ts.ut1_jd(mjd + 2400000.5)
     ra, dec, _ = earth.at(t).observe(moon).radec()
     
     return ra._degrees, dec.degrees
@@ -181,45 +199,39 @@ def lunar_radec(date):
 #Calculate target angular distance from the moon
 def angle_to_moon(obj, lunar_coords):
     r_moon, d_moon = lunar_coords
+
     #r_sn, d_sn = convert_hms_ra(obj[0]), convert_hms_dec(obj[1])
     r_sn, d_sn = obj[0], obj[1]
     angles = np.arange(0, 361, 1)
     theta_moon = angles - r_moon
     theta_sn = angles - r_sn
 
-    return int(arccos( sin(d_moon)*sin(d_sn) + cos(d_moon)*cos(d_sn) * ( sin(theta_moon)*sin(theta_sn) + cos(theta_moon)*cos(theta_sn) ) )[0])
+    return arccos( sin(d_moon)*sin(d_sn) + cos(d_moon)*cos(d_sn) * ( sin(theta_moon)*sin(theta_sn) + cos(theta_moon)*cos(theta_sn) ) )
 
 #Calculating twilight angles
-def twilights(date, obs):
-    ra0 = np.arange(0, 362, 1)
-    solar_coords = solar_radec(date)
-    solar_path0 = path(solar_coords, obs)
-    #mid_point = ra0[np.argmin(solar_path0)]
-    mid_point = solar_coords[0] + day_rotation/2
-
-    ra = np.arange(mid_point-180, mid_point+180, 1)
-    solar_path = offset_path(solar_radec(date), obs, mid_point)
+def twilights(solar_coords, obs, era):
+    solar_path = path_era(solar_coords, obs, era)
     
     astronomical_twilight = [0, 0]
     nautical_twilight = [0, 0]
     civil_twilight = [0, 0]
     
-    for i in range(len(ra) - 1):
+    for i in range(len(era) - 1):
         if solar_path[i] < -18.0 and solar_path[i+1] > -18.0:
-            astronomical_twilight[1] = ra[i]
+            astronomical_twilight[1] = era[i]
         if solar_path[i] > -18.0 and solar_path[i+1] < -18.0:
-            astronomical_twilight[0] = ra[i]
+            astronomical_twilight[0] = era[i]
             
-    for i in range(len(ra) - 1):
+    for i in range(len(era) - 1):
         if solar_path[i] < -12.0 and solar_path[i+1] > -12.0:
-            nautical_twilight[1] = ra[i]
+            nautical_twilight[1] = era[i]
         if solar_path[i] > -12.0 and solar_path[i+1] < -12.0:
-            nautical_twilight[0] = ra[i]
+            nautical_twilight[0] = era[i]
             
-    for i in range(len(ra) - 1):
+    for i in range(len(era) - 1):
         if solar_path[i] < -6.0 and solar_path[i+1] > -6.0:
-            civil_twilight[1] = ra[i]
+            civil_twilight[1] = era[i]
         if solar_path[i] > -6.0 and solar_path[i+1] < -6.0:
-            civil_twilight[0] = ra[i]
+            civil_twilight[0] = era[i]
                 
-    return solar_coords, mid_point, [astronomical_twilight, nautical_twilight, civil_twilight]
+    return [astronomical_twilight, nautical_twilight, civil_twilight], solar_path
