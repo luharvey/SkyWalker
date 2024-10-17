@@ -207,9 +207,11 @@ class night():
         #Calculating target paths across the sky
         self.paths = {}
         self.lunar_distances = {}
+        self.nautical_directions = {}
         for i,n in enumerate(self.names):
             self.paths[n] = functions.path_era([self.data['ra'][i], self.data['dec'][i]], self.observatory, self.era)
             self.lunar_distances[n] = functions.angle_to_moon([self.data['ra'][i], self.data['dec'][i]], self.lunar_coords)
+            self.nautical_directions[n] = functions.calculate_pointing([self.data['ra'][i], self.data['dec'][i]], self.observatory, self.era)
 
     #Plotting function
     def plot_paths(self, targets = None, priorities = None, moon = True, lunar_distance = False, angle_limits = True, figsize = (15,10), title = None, angle_ax = False):
@@ -340,7 +342,11 @@ class night():
         
         fig.show()
 
-    def generate_queue(self, limiting_twilight = 'astronomical'):
+    def generate_queue(self, limiting_twilight = 'astronomical', restricted_directions = []):
+        self.restricted_directions = []
+        for d in restricted_directions:
+            self.restricted_directions.append(d.upper())
+
         #Deciding which sunset to start the queue from
         if limiting_twilight == 'astronomical':
             self.limiting_twilight = self.twilights[0]
@@ -370,9 +376,17 @@ class night():
                 self.add_to_queue(name)
 
         #If we are yet to cross the morning twilight however have now observable targets remaining, introduce a gap to the queue
-        while self.queue.start_angle[-1] + self.queue.obs_time_angles[-1] < self.limiting_twilight[1]:
+        try:
+            while self.queue.start_angle[-1] + self.queue.obs_time_angles[-1] < self.limiting_twilight[1]:
+                self.add_gap_to_queue()
+                self.check_reserve_list()
+        except:
             self.add_gap_to_queue()
             self.check_reserve_list()
+            while self.queue.start_angle[-1] + self.queue.obs_time_angles[-1] < self.limiting_twilight[1]:
+                self.add_gap_to_queue()
+                self.check_reserve_list()
+                
 
     def add_to_queue(self, name):
         #Check if object meets the angular requirements somewhere between astronomical sunset and sunrise
@@ -468,9 +482,11 @@ class night():
         for name in queue.index:
             if '__gap' not in name:
                 cut_path = functions.cut_array(self.era, self.paths[name], [queue['start_angle'][name], queue['start_angle'][name]+queue['obs_time_angles'][name]], self.lunar_distances[name])
+                cut_nautical_direction = functions.cut_array(self.era, self.nautical_directions[name], [queue['start_angle'][name], queue['start_angle'][name]+queue['obs_time_angles'][name]])[1]
+
                 for i in range(len(cut_path[0])):
-                    if self.max_angle < cut_path[1][i] or self.min_angle > cut_path[1][i] or cut_path[2][i] < self.minimum_lunar_distance:
-                        #Invalid angle instance or lunar distance located, return False
+                    if self.max_angle < cut_path[1][i] or self.min_angle > cut_path[1][i] or cut_path[2][i] < self.minimum_lunar_distance or cut_nautical_direction[i] in self.restricted_directions:
+                        #Invalid angle instance, lunar distance, or restricted pointing located, return False
                         return False
                 
                     #Overlapping with final twilight
@@ -483,10 +499,11 @@ class night():
     def check_valid_object(self, name):
         #Cut object path to between astronomical sunset and sunrise
         cut_path = functions.cut_array(self.era, self.paths[name], [self.limiting_twilight[0], self.limiting_twilight[1]], self.lunar_distances[name])
+        cut_nautical_direction = functions.cut_array(self.era, self.nautical_directions[name], [self.limiting_twilight[0], self.limiting_twilight[1]])[1]
 
         for i in range(len(cut_path[0])):
-            if self.min_angle < cut_path[1][i] < self.max_angle and cut_path[2][i] > self.minimum_lunar_distance:
-                #Valid angle instance located, return True
+            if self.min_angle < cut_path[1][i] < self.max_angle and cut_path[2][i] > self.minimum_lunar_distance and cut_nautical_direction[i] not in self.restricted_directions:
+                #Valid angle instance, lunar distance, and poiting located, return True
                 return True
         return False
 
@@ -523,14 +540,19 @@ class night():
 
     #Function to introduce a gap (or extend an existing gap) in a queue due to a lack of observable objects
     def add_gap_to_queue(self):
-        #If the most recent item in the queue is a gap, extend the gap
-        if '__gap' in self.queue.index[-1]:
-            self.queue['obs_time_angles'][-1] += 1
-        #Otherwise introduce a new gap
-        else:
+        try:
+            #If the most recent item in the queue is a gap, extend the gap
+            if '__gap' in self.queue.index[-1]:
+                self.queue['obs_time_angles'][-1] += 1
+            #Otherwise introduce a new gap
+            else:
+                index = 1
+                for name in self.queue.index:
+                    if '__gap' in name:
+                        index += 1
+                new_row = {'ra':None, 'dec':None, 'priority':None, 'obs_times':None, 'obs_time_angles':1, 'night_peak':None, 'start_angle':self.queue['start_angle'][-1] + self.queue['obs_time_angles'][-1], 'start_ut':functions.era_to_utc(self.queue['start_angle'][-1] + self.queue['obs_time_angles'][-1])} 
+                self.queue.loc[f'__gap{index}__'] = new_row
+        except:
             index = 1
-            for name in self.queue.index:
-                if '__gap' in name:
-                    index += 1
-            new_row = {'ra':None, 'dec':None, 'priority':None, 'obs_times':None, 'obs_time_angles':1, 'night_peak':None, 'start_angle':self.queue['start_angle'][-1] + self.queue['obs_time_angles'][-1], 'start_ut':functions.era_to_utc(self.queue['start_angle'][-1] + self.queue['obs_time_angles'][-1])} 
+            new_row = {'ra':None, 'dec':None, 'priority':None, 'obs_times':None, 'obs_time_angles':1, 'night_peak':None, 'start_angle':self.limiting_twilight[0], 'start_ut':functions.era_to_utc(self.limiting_twilight[0])} 
             self.queue.loc[f'__gap{index}__'] = new_row
