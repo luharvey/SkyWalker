@@ -69,17 +69,6 @@ def convert_latitude(angle):
     return factor * (float(split[0][:-1]) + float(split[1][:-1])/60 + float(split[2][:-1])/3600)
 
 #Converting longitude
-#def convert_longitude(angle):
-#    split = angle.split()
-#    if split[-1] == 'W':
-#        factor = -1
-#        offset = 360
-#    else:
-#        factor = 1
-#        offset = 0
-#        
-#    return offset + factor * (float(split[0][:-1]) + float(split[1][:-1])/60 + float(split[2][:-1])/3600)
-#Converting longitude
 def convert_longitude(angle):
     split = angle.split()
     if split[-1] == 'W':
@@ -181,6 +170,45 @@ def path_era(obj, obs, era):
     theta = angles-r-b
     
     return arcsin( sin(a)*sin(d) + cos(a)*cos(d)*cos(theta) )
+
+#Calculating the nautical direction of the pointing
+def calculate_pointing(obj, obs, era):
+    if type(obj[0]) == str or type(obj[0]) == float:
+        r, d = convert_hms_ra(obj[0]), convert_hms_dec(obj[1])
+    else:
+        r, d = obj
+    a = obs.latitude
+    b = obs.longitude
+
+    angles = era
+    theta = angles-r-b
+    
+    e = -cos(d)*sin(theta)
+    n = (sin(d) * cos(a)) - (cos(d) * cos(theta) * sin(a))
+    length = np.sqrt(e**2 + n**2)
+    
+    tau = arccos( n/length )
+    
+    dirs_e = ['N', 'NE', 'E', 'SE', 'S']
+    dirs_w = ['N', 'NW', 'W', 'SW', 'S']
+    
+    ranges_e = {'N':[0.0, 22.5], 'NE':[22.5, 67.5], 'E':[67.5, 112.5], 'SE':[112.5, 157.5], 'S':[157.5, 180.0]}
+    ranges_w = {'N':[0.0, 22.5], 'NW':[22.5, 67.5], 'W':[67.5, 112.5], 'SW':[112.5, 157.5], 'S':[157.5, 180.0]}
+    
+    dirs = []
+    
+    for i in range(len(e)):
+        if e[i] >= 0.0:
+            for index in dirs_e:
+                if ranges_e[index][0]<=tau[i]<=ranges_e[index][1]:
+                    dirs.append(index)
+                    break
+        else:
+            for index in dirs_w:
+                if ranges_w[index][0]<=tau[i]<=ranges_w[index][1]:
+                    dirs.append(index)
+                    break
+    return dirs
 
 #Calculate solar coordinates for given date (mjd)
 def solar_radec_mjd(mjd):
